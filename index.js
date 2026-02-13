@@ -1,574 +1,355 @@
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
+import cron from 'node-cron';
+import { Pool } from 'pg';
 
-/**
- * SpyTON Scanner Bot (TON)
- *
- * Features
- * 1) Manual scan:
- *    - /scan <CA>
- *    - or send a jetton master address (EQ... / UQ...) in chat
- *
- * 2) Auto-post new Jetton deployments to a channel (like sunpump_new_tokens):
- *    - Polls TON Center API v3 for latest Jetton masters
- *    - When a new master appears, bot posts the Scanner card to your channel
- *
- * Requirements for auto-posting:
- * - Add the bot as ADMIN in your channel
- * - Set SCANNER_CHANNEL to @channelusername OR numeric channel id (-100...)
- *
- * Env
- * - BOT_TOKEN (required)
- * - TONCENTER_API_KEY (optional but recommended)
- * - TONCENTER_BASE (default https://toncenter.com)
- * - SCANNER_CHANNEL (optional; enable auto-post)
- * - POLL_INTERVAL_SEC (default 25)
- *
- * Buttons (your links)
- * - DTRADE_REF (default 11TYq7LInG)  -> https://t.me/dtrade?start=<ref>_<ca>
- * - PROMOTE_URL (default https://t.me/Vseeton)
- * - TRENDING_URL (default https://t.me/SpyTonTrending)
- */
-
+// ===== ENV =====
 const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) {
-  console.error('Missing BOT_TOKEN in .env');
-  process.exit(1);
+if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
+
+const TRENDING_CHANNEL = process.env.TRENDING_CHANNEL || '@SpyTonTrending';
+const LEADERBOARD_CHAT = process.env.LEADERBOARD_CHAT || TRENDING_CHANNEL; // where to post daily board
+const TZ = process.env.TZ || 'Africa/Lagos'; // GMT+1
+
+// Admin IDs: comma-separated numeric telegram user ids
+const ADMIN_IDS = new Set(
+  (process.env.ADMIN_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
+// Postgres connection (Railway provides DATABASE_URL when you add Postgres)
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  throw new Error('Missing DATABASE_URL. Add a Postgres database in Railway and set DATABASE_URL.');
 }
 
-const TONCENTER_BASE = (process.env.TONCENTER_BASE || 'https://toncenter.com').replace(/\/+$/, '');
-const TONCENTER_API_KEY = process.env.TONCENTER_API_KEY || ''; // optional but recommended
-
-const SCANNER_CHANNEL = process.env.SCANNER_CHANNEL || ''; // @channel OR -100...
-const POLL_INTERVAL_SEC = Number(process.env.POLL_INTERVAL_SEC || 25);
-
-const DTRADE_REF = process.env.DTRADE_REF || '11TYq7LInG';
-const PROMOTE_URL = process.env.PROMOTE_URL || 'https://t.me/Vseeton';
-const TRENDING_URL = process.env.TRENDING_URL || 'https://t.me/SpyTonTrending';
-
-// Explorers
-const CODE_EXPLORER_BASE = (process.env.CODE_EXPLORER_BASE || 'https://tonviewer.com/').replace(/\/+$/, '') + '/';
-const HOLDERS_EXPLORER_BASE = (process.env.HOLDERS_EXPLORER_BASE || 'https://tonscan.org/jetton/').replace(/\/+$/, '') + '/';
-const ADDRESS_EXPLORER_BASE = (process.env.ADDRESS_EXPLORER_BASE || 'https://tonscan.org/address/').replace(/\/+$/, '') + '/';
+const DAILY_HOUR = parseInt(process.env.DAILY_HOUR || '20', 10); // 20:00
+const DAILY_MIN = parseInt(process.env.DAILY_MIN || '0', 10);
 
 const bot = new Telegraf(BOT_TOKEN);
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: process.env.PGSSLMODE ? { rejectUnauthorized: false } : undefined });
 
-// Telegram "start" payload allowed chars: A-Z a-z 0-9 _ - ; max 64 chars.
-function makeStartPayload(ref, ca) {
-  const raw = `${ref}_${ca}`;
-  const safe = raw.replace(/[^A-Za-z0-9_-]/g, '-');
-  return safe.slice(0, 64);
+// ===== DB =====
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      user_id BIGINT PRIMARY KEY,
+      username TEXT,
+      first_name TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS invites (
+      inviter_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      chat_id BIGINT NOT NULL,
+      invite_link TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (inviter_id, chat_id)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS joins (
+      chat_id BIGINT NOT NULL,
+      inviter_id BIGINT NOT NULL,
+      joined_user_id BIGINT NOT NULL,
+      joined_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (chat_id, joined_user_id)
+    );
+  `);
 }
 
-function buildKeyboard(ca) {
-  const payload = makeStartPayload(DTRADE_REF, ca);
-  const dtradeUrl = `https://t.me/dtrade?start=${payload}`;
-
-  return Markup.inlineKeyboard([
-    [Markup.button.url('🟦 Buy with Dtrade', dtradeUrl)],
-    [
-      Markup.button.url('📣 Promote Your Token', PROMOTE_URL),
-      Markup.button.url('🔥 Trending', TRENDING_URL),
-    ],
-  ]);
+function isAdmin(ctx) {
+  return ADMIN_IDS.has(String(ctx.from?.id || ''));
 }
 
-function formatLinksRow({ ca, deployer }) {
-  const codeUrl = `${CODE_EXPLORER_BASE}${encodeURIComponent(ca)}`;
-  const deployerUrl = deployer && deployer !== '—'
-    ? `${ADDRESS_EXPLORER_BASE}${encodeURIComponent(deployer)}`
-    : `${CODE_EXPLORER_BASE}${encodeURIComponent(ca)}`;
-  const holdersUrl = `${HOLDERS_EXPLORER_BASE}${encodeURIComponent(ca)}`;
-
-  // Telegram HTML parse mode
-  return `<a href="${codeUrl}">Code</a> | <a href="${deployerUrl}">Deployer</a> | <a href="${holdersUrl}">Holders</a>`;
+async function upsertUser(tgUser) {
+  if (!tgUser?.id) return;
+  await pool.query(
+    `INSERT INTO users (user_id, username, first_name)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name;`,
+    [tgUser.id, tgUser.username || null, tgUser.first_name || null]
+  );
 }
 
+async function ensureInviteLink(inviterId, chatId) {
+  const existing = await pool.query(
+    `SELECT invite_link FROM invites WHERE inviter_id=$1 AND chat_id=$2`,
+    [inviterId, chatId]
+  );
+  if (existing.rowCount > 0) return existing.rows[0].invite_link;
 
-function shortAddr(addr) {
-  const a = String(addr || '').trim();
-  if (!a) return '—';
-  // Supports both "EQ..." and "0:..." forms
-  if (a.length <= 18) return a;
-  return `${a.slice(0, 10)}…${a.slice(-8)}`;
-}
-
-function escapeHtml(str) {
-  return String(str)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;');
-}
-
-// Basic TON friendly address detection (looks like EQ... / UQ... base64url)
-function extractTonAddress(text) {
-  if (!text) return null;
-  const m = String(text).match(/\b[EU]Q[A-Za-z0-9_-]{45,70}\b/);
-  return m ? m[0] : null;
-}
-
-function toTon(nano) {
-  const v = Number(nano);
-  if (!Number.isFinite(v)) return null;
-  return v / 1e9;
-}
-
-function formatNumberWithCommas(n) {
-  const s = String(n);
-  // handle bigint-like strings
-  const parts = s.split('.');
-  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  return parts.join('.');
-}
-
-function formatSupply(totalSupplyRaw, decimals) {
-  if (totalSupplyRaw == null) return '—';
-  const rawStr = String(totalSupplyRaw);
-
-  // If decimals is unknown, show raw integer.
-  const dec = Number(decimals);
-  if (!Number.isFinite(dec) || dec < 0 || dec > 18) return formatNumberWithCommas(rawStr);
-
-  // BigInt safe formatting
-  try {
-    const bi = BigInt(rawStr);
-    const base = BigInt(10) ** BigInt(dec);
-    const intPart = bi / base;
-    const fracPart = bi % base;
-
-    let frac = fracPart.toString().padStart(dec, '0');
-    // trim trailing zeros
-    frac = frac.replace(/0+$/, '');
-    const out = frac ? `${intPart.toString()}.${frac}` : intPart.toString();
-    return formatNumberWithCommas(out);
-  } catch {
-    return formatNumberWithCommas(rawStr);
-  }
-}
-
-function pickMeta(content, keys) {
-  if (!content || typeof content !== 'object') return null;
-  for (const k of keys) {
-    if (content[k] != null && String(content[k]).trim() !== '') return content[k];
-  }
-  return null;
-}
-
-function buildSocialLinks(jettonContent) {
-  const content = jettonContent || {};
-  let tg =
-    pickMeta(content, ['telegram', 'tg', 'telegram_url', 'telegramUrl']) ||
-    (content.social && pickMeta(content.social, ['telegram', 'tg']));
-  tg = normalizeSocialUrl('tg', tg);
-  let web =
-    pickMeta(content, ['website', 'site', 'url', 'homepage']) ||
-    (content.social && pickMeta(content.social, ['website', 'site', 'url']));
-  web = normalizeSocialUrl('web', web);
-  let x =
-    pickMeta(content, ['twitter', 'x', 'twitter_url', 'x_url']) ||
-    (content.social && pickMeta(content.social, ['twitter', 'x']));
-  x = normalizeSocialUrl('x', x);
-
-  const parts = [];
-  if (tg) parts.push(`<a href="${escapeHtml(String(tg))}">TG</a>`);
-  else parts.push('TG ?');
-
-  if (web) parts.push(`<a href="${escapeHtml(String(web))}">Web</a>`);
-  else parts.push('Web ?');
-
-  if (x) parts.push(`<a href="${escapeHtml(String(x))}">X</a>`);
-  else parts.push('X ?');
-
-  return parts.join(' | ');
-}
-
-
-// --- Metadata enrichment (off-chain JSON / IPFS) ---
-// Many jettons store name/symbol/socials in off-chain JSON referenced by `uri`.
-// This makes "Links" auto-populate more often (like SunTools style).
-const IPFS_GATEWAY = process.env.IPFS_GATEWAY || 'https://ipfs.io/ipfs/';
-
-function toHttpFromIpfs(uri) {
-  if (!uri) return null;
-  const u = String(uri).trim();
-  if (u.startsWith('ipfs://')) {
-    return IPFS_GATEWAY.replace(/\/+$/,'/') + u.replace('ipfs://','');
-  }
-  return u;
-}
-
-function normalizeSocialUrl(kind, value) {
-  if (!value) return null;
-  let v = String(value).trim();
-  if (!v) return null;
-
-  // If only a handle is provided, convert to full URL
-  if (kind === 'tg') {
-    v = v.replace(/^@/, '');
-    if (!v.startsWith('http')) return `https://t.me/${v}`;
-  }
-  if (kind === 'x') {
-    v = v.replace(/^@/, '');
-    if (!v.startsWith('http')) return `https://x.com/${v}`;
-  }
-  if (kind === 'web') {
-    if (!v.startsWith('http')) v = 'https://' + v;
-  }
-  return v;
-}
-
-function extractLinksFromText(text) {
-  const t = String(text || '');
-  const out = {};
-
-  // Telegram
-  const tg = t.match(/https?:\/\/t\.me\/[A-Za-z0-9_]{3,}/i);
-  if (tg) out.tg = tg[0];
-
-  // Website
-  const web = t.match(/https?:\/\/[A-Za-z0-9.-]+\.[A-Za-z]{2,}[^ \n)"]*/i);
-  if (web) out.web = web[0];
-
-  // Twitter / X
-  const x = t.match(/https?:\/\/(x\.com|twitter\.com)\/[A-Za-z0-9_]{1,}/i);
-  if (x) out.x = x[0];
-
-  return out;
-}
-
-async function fetchJson(url) {
-  if (!url) return null;
-  try {
-    const res = await fetch(url, { redirect: 'follow' });
-    if (!res.ok) return null;
-    const ct = res.headers.get('content-type') || '';
-    // Accept JSON or plain text JSON
-    if (!ct.includes('application/json') && !ct.includes('text/plain') && !ct.includes('text/json')) {
-      // Still try parse
-    }
-    return await res.json();
-  } catch (_) {
-    return null;
-  }
-}
-
-async function enrichJettonContent(jettonContent) {
-  const base = jettonContent || {};
-  // toncenter may return `uri` or `content_uri` or nested `metadata_uri`
-  const uri =
-    pickMeta(base, ['uri', 'content_uri', 'metadata_uri', 'metadataUri']) ||
-    (base.content && pickMeta(base.content, ['uri', 'content_uri', 'metadata_uri']));
-
-  const httpUri = toHttpFromIpfs(uri);
-  const meta = await fetchJson(httpUri);
-
-  // Merge: meta wins where base missing
-  const merged = { ...base };
-  if (meta && typeof meta === 'object') {
-    for (const [k, v] of Object.entries(meta)) {
-      if (merged[k] == null || merged[k] === '' || merged[k] === 'Unknown' || merged[k] === 'UNKNOWN') {
-        merged[k] = v;
-      }
-    }
-    // Some metadata nests socials
-    if (meta.social && typeof meta.social === 'object') {
-      merged.social = { ...(base.social || {}), ...meta.social };
-    }
-  }
-
-  // If socials still missing, try parse description text
-  const desc = pickMeta(merged, ['description', 'about']) || '';
-  const fromText = extractLinksFromText(desc);
-  if (fromText.tg && !pickMeta(merged, ['telegram', 'tg', 'telegram_url', 'telegramUrl']) && !(merged.social && pickMeta(merged.social, ['telegram','tg']))) {
-    merged.telegram = fromText.tg;
-  }
-  if (fromText.web && !pickMeta(merged, ['website', 'site', 'url', 'homepage']) && !(merged.social && pickMeta(merged.social, ['website','site','url']))) {
-    merged.website = fromText.web;
-  }
-  if (fromText.x && !pickMeta(merged, ['twitter', 'x', 'twitter_url', 'x_url']) && !(merged.social && pickMeta(merged.social, ['twitter','x']))) {
-    merged.twitter = fromText.x;
-  }
-
-  return merged;
-}
-
-
-async function toncenterGet(path, params = {}) {
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v == null) continue;
-    if (Array.isArray(v)) {
-      for (const item of v) qs.append(k, String(item));
-    } else {
-      qs.append(k, String(v));
-    }
-  }
-
-  const url = `${TONCENTER_BASE}${path}?${qs.toString()}`;
-  const headers = { accept: 'application/json' };
-  if (TONCENTER_API_KEY) headers['X-API-Key'] = TONCENTER_API_KEY;
-
-  const res = await fetch(url, { headers });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    throw new Error(`TONCenter ${res.status}: ${txt.slice(0, 300)}`);
-  }
-  return res.json();
-}
-
-async function fetchJettonMaster(ca) {
-  // Returns { address, admin_address, jetton_content, mintable, total_supply, last_transaction_lt }
-  const r = await toncenterGet('/api/v3/jetton/masters', { address: [ca], limit: 1, offset: 0 });
-  const jm = (r && r.jetton_masters && r.jetton_masters[0]) ? r.jetton_masters[0] : null;
-  return jm;
-}
-
-async function fetchDeployerFromFirstTx(ca) {
-  // First tx (ascending lt). Usually deployer wallet is in in_msg.source for internal deploy.
-  const r = await toncenterGet('/api/v3/transactions', { account: [ca], limit: 1, offset: 0, sort: 'asc' });
-  const tx = (r && r.transactions && r.transactions[0]) ? r.transactions[0] : null;
-  const src = tx?.in_msg?.source;
-  return src && String(src).trim() ? String(src) : '—';
-}
-
-async function fetchAccountBalanceTon(address) {
-  if (!address || address === '—') return null;
-  const r = await toncenterGet('/api/v3/accountStates', { address: [address], limit: 1, offset: 0 });
-  const st = (r && r.account_states && r.account_states[0]) ? r.account_states[0] : null;
-  const bal = st?.balance;
-  const ton = toTon(bal);
-  return ton == null ? null : ton;
-}
-
-function renderScannerMessage(data) {
-  const {
-    name = 'Unknown',
-    symbol = 'UNKNOWN',
-    supply = '—',
-    decimals = '—',
-    ca,
-    deployer = '—',
-    mintable = null,
-    adminAddress = null,
-    creatorBalanceTon = null,
-    socialLinks = 'TG ? | Web ? | X ?',
-  } = data;
-
-  const deployerUrl = `${EXPLORER_BASE}${encodeURIComponent(deployer && deployer !== '—' ? deployer : ca)}`;
-
-  const mintText =
-    mintable === true ? '✅ Mintable' : mintable === false ? '❌ Not mintable' : '—';
-  const adminText =
-    adminAddress && adminAddress !== '—' ? '⚠️ Admin set' : '✅ Admin renounced';
-
-  const creatorBalText =
-    creatorBalanceTon == null ? '—' : `${creatorBalanceTon.toFixed(2)} TON`;
-
-  const body =
-`🧿 <b>SpyTON Scanner — New Jetton Detected</b>
-
-<b>Name:</b> ${escapeHtml(name)}
-<b>Symbol:</b> ${escapeHtml(symbol)}
-<b>Supply:</b> ${escapeHtml(String(supply))} (${escapeHtml(String(decimals))} decimals)
-
-<b>CA:</b>
-<code>${escapeHtml(ca)}</code>
-<b>Deployer:</b> <a href="${deployerUrl}"><code>${escapeHtml(shortAddr(deployer))}</code></a>
-<b>Admin/Mint:</b> ${mintText} / ${adminText}
-<b>Creator Balance:</b> ${escapeHtml(creatorBalText)}
-
-<b>Links:</b> ${socialLinks}
-
-${formatLinksRow({ ca, deployer })}`;
-
-  return body;
-}
-
-async function buildJettonCard(ca) {
-  const master = await fetchJettonMaster(ca);
-  if (!master) {
-    // Not a jetton master or not indexed yet
-    return {
-      ca,
-      name: 'Unknown',
-      symbol: 'UNKNOWN',
-      supply: '—',
-      decimals: '—',
-      deployer: '—',
-      mintable: null,
-      adminAddress: '—',
-      creatorBalanceTon: null,
-      socialLinks: 'TG ? | Web ? | X ?',
-    };
-  }
-
-  const content = await enrichJettonContent(master.jetton_content || {});
-  const name = pickMeta(content, ['name', 'title']) || 'Unknown';
-  const symbol = pickMeta(content, ['symbol', 'ticker']) || 'UNKNOWN';
-  const decimals = Number(pickMeta(content, ['decimals'])) || 9;
-
-  const supply = formatSupply(master.total_supply, decimals);
-  const deployer = await fetchDeployerFromFirstTx(ca);
-  const creatorBalanceTon = await fetchAccountBalanceTon(deployer);
-  const socialLinks = buildSocialLinks(content);
-
-  return {
-    ca,
-    name,
-    symbol,
-    supply,
-    decimals,
-    deployer,
-    mintable: master.mintable,
-    adminAddress: master.admin_address || '—',
-    creatorBalanceTon,
-    socialLinks,
-  };
-}
-
-/**
- * Send scanner alert to any chat/channel
- */
-export async function sendScannerAlert(chatId, ca) {
-  const data = await buildJettonCard(ca);
-
-  await bot.telegram.sendMessage(chatId, renderScannerMessage(data), {
-    parse_mode: 'HTML',
-    ...buildKeyboard(ca),
-    disable_web_page_preview: true,
+  // Create a unique invite link tied to inviter id.
+  // NOTE: Requires bot to be admin in the channel with "Invite Users" permission.
+  const inviteLink = await bot.telegram.createChatInviteLink(chatId, {
+    name: `ref_${inviterId}`,
+    creates_join_request: false,
   });
+
+  await pool.query(
+    `INSERT INTO invites (inviter_id, chat_id, invite_link) VALUES ($1,$2,$3)
+     ON CONFLICT (inviter_id, chat_id) DO UPDATE SET invite_link=EXCLUDED.invite_link;`,
+    [inviterId, chatId, inviteLink.invite_link]
+  );
+
+  return inviteLink.invite_link;
 }
 
-// === COMMANDS ===
+async function getTrendingChatId() {
+  // We need the numeric chat id to create invite links.
+  // If user provides TRENDING_CHAT_ID env, use that. Otherwise, resolve via getChat.
+  const forced = process.env.TRENDING_CHAT_ID;
+  if (forced) return parseInt(forced, 10);
+
+  const chat = await bot.telegram.getChat(TRENDING_CHANNEL);
+  return chat.id;
+}
+
+async function getTop(chatId, limit=10) {
+  const res = await pool.query(
+    `SELECT u.user_id, u.username, u.first_name, COUNT(j.joined_user_id)::INT AS joins
+     FROM joins j
+     JOIN users u ON u.user_id = j.inviter_id
+     WHERE j.chat_id = $1
+     GROUP BY u.user_id, u.username, u.first_name
+     ORDER BY joins DESC
+     LIMIT $2;`,
+    [chatId, limit]
+  );
+  return res.rows;
+}
+
+function fmtName(row) {
+  if (row.username) return `@${row.username}`;
+  return row.first_name ? row.first_name : String(row.user_id);
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("'",'&#039;');
+}
+
+async function sendLeaderboard() {
+  const chatId = await getTrendingChatId();
+  const top = await getTop(chatId, 10);
+
+  let text = `🧿 <b>SpyTON Daily Boost Leaderboard</b>\n<b>Channel:</b> ${escapeHtml(TRENDING_CHANNEL)}\n\n`;
+  if (!top.length) {
+    text += `No referrals yet today.\n\nType /ref in @SpyTonRadarBot to get your invite link.`;
+  } else {
+    top.forEach((r, i) => {
+      text += `${i+1}. <b>${escapeHtml(fmtName(r))}</b> — <b>${r.joins}</b> joins\n`;
+    });
+    text += `\nGet your invite link: DM <b>@SpyTonRadarBot</b> and type <b>/ref</b>`;
+  }
+
+  await bot.telegram.sendMessage(LEADERBOARD_CHAT, text, { parse_mode: 'HTML', disable_web_page_preview: true });
+}
+
+// ===== BOT UX =====
 bot.start(async (ctx) => {
+  await upsertUser(ctx.from);
   const msg =
-`🧿 <b>SpyTON Scanner</b>
+`🧿 <b>SpyTON Boost Bot</b>
 
-Send a Jetton CA (TON address) or use:
-<code>/scan EQ...</code>
+I help you grow <b>${TRENDING_CHANNEL}</b> with a personal invite link.
 
-If you set <b>SCANNER_CHANNEL</b>, I will also auto-post new Jetton deployments to your channel.`;
+Commands:
+• <b>/ref</b> — Get your referral link
+• <b>/stats</b> — See your invites
+• <b>/top</b> — Leaderboard
+
+Share your link in groups. Every join counts.`;
   await ctx.reply(msg, { parse_mode: 'HTML', disable_web_page_preview: true });
 });
 
-bot.command('scan', async (ctx) => {
-  const parts = ctx.message.text.split(/\s+/).slice(1);
-  const ca = parts[0] ? extractTonAddress(parts[0]) : null;
+bot.command('ref', async (ctx) => {
+  await upsertUser(ctx.from);
 
-  if (!ca) {
-    await ctx.reply('Send like: /scan EQ...', { disable_web_page_preview: true });
+  const chatId = await getTrendingChatId();
+  try {
+    const link = await ensureInviteLink(ctx.from.id, chatId);
+    const text =
+`✅ <b>Your SpyTON referral link</b>
+${escapeHtml(link)}
+
+Share it anywhere. Every user who joins <b>${TRENDING_CHANNEL}</b> with this link counts for you.`;
+    await ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true });
+  } catch (e) {
+    console.error(e);
+    await ctx.reply(
+      `I couldn't create your invite link.\n\nFix: add this bot as <b>Admin</b> in ${TRENDING_CHANNEL} with permission: <b>Invite Users</b>.`,
+      { parse_mode: 'HTML' }
+    );
+  }
+});
+
+bot.command('stats', async (ctx) => {
+  await upsertUser(ctx.from);
+  const chatId = await getTrendingChatId();
+  const res = await pool.query(
+    `SELECT COUNT(*)::INT AS joins
+     FROM joins
+     WHERE chat_id=$1 AND inviter_id=$2;`,
+    [chatId, ctx.from.id]
+  );
+  const joins = res.rows?.[0]?.joins ?? 0;
+  await ctx.reply(`🧿 Your referrals: ${joins}`, { disable_web_page_preview: true });
+});
+
+bot.command('top', async (ctx) => {
+  const chatId = await getTrendingChatId();
+  const top = await getTop(chatId, 10);
+  if (!top.length) {
+    await ctx.reply(`No referrals yet.\nDM @SpyTonRadarBot and type /ref to start.`, { disable_web_page_preview: true });
     return;
   }
-
-  try {
-    const data = await buildJettonCard(ca);
-    await ctx.reply(renderScannerMessage(data), {
-      parse_mode: 'HTML',
-      ...buildKeyboard(ca),
-      disable_web_page_preview: true,
-    });
-  } catch (e) {
-    console.error(e);
-    await ctx.reply('Scanner error. Check TONCENTER_API_KEY / TONCENTER_BASE and try again.', { disable_web_page_preview: true });
-  }
-});
-
-// If user just sends an address, auto-scan (reply in same chat)
-bot.on('text', async (ctx) => {
-  const ca = extractTonAddress(ctx.message.text);
-  if (!ca) return;
-
-  try {
-    const data = await buildJettonCard(ca);
-    await ctx.reply(renderScannerMessage(data), {
-      parse_mode: 'HTML',
-      ...buildKeyboard(ca),
-      disable_web_page_preview: true,
-    });
-  } catch (e) {
-    console.error(e);
-    // silent fail in chat to avoid spam
-  }
-});
-
-// === AUTO WATCHER ===
-let watcherStarted = false;
-let lastSeenLt = 0n; // BigInt
-
-async function initLastSeenLt() {
-  const r = await toncenterGet('/api/v3/jetton/masters', { limit: 50, offset: 0 });
-  const list = (r && r.jetton_masters) ? r.jetton_masters : [];
-  const lts = list.map((j) => {
-    try { return BigInt(j.last_transaction_lt || '0'); } catch { return 0n; }
+  let text = `🧿 <b>SpyTON Top Referrers</b>\n\n`;
+  top.forEach((r, i) => {
+    text += `${i+1}. <b>${escapeHtml(fmtName(r))}</b> — <b>${r.joins}</b>\n`;
   });
-  lastSeenLt = lts.reduce((a, b) => (b > a ? b : a), 0n);
-}
-
-async function pollNewJettons() {
-  const r = await toncenterGet('/api/v3/jetton/masters', { limit: 100, offset: 0 });
-  const list = (r && r.jetton_masters) ? r.jetton_masters : [];
-
-  // sort by lt desc
-  const sorted = list
-    .map((j) => {
-      let lt = 0n;
-      try { lt = BigInt(j.last_transaction_lt || '0'); } catch { lt = 0n; }
-      return { ...j, _lt: lt };
-    })
-    .sort((a, b) => (a._lt === b._lt ? 0 : a._lt > b._lt ? -1 : 1));
-
-  const fresh = sorted.filter((j) => j._lt > lastSeenLt);
-
-  if (fresh.length === 0) return;
-
-  // post oldest first so channel reads chronologically
-  const toPost = fresh.sort((a, b) => (a._lt === b._lt ? 0 : a._lt > b._lt ? 1 : -1));
-
-  // move cursor
-  lastSeenLt = fresh.reduce((a, j) => (j._lt > a ? j._lt : a), lastSeenLt);
-
-  for (const j of toPost) {
-    const ca = j.address;
-    try {
-      await sendScannerAlert(SCANNER_CHANNEL, ca);
-      // light delay to avoid rate limits
-      await new Promise((r) => setTimeout(r, 800));
-    } catch (e) {
-      console.error('Auto-post failed:', e?.message || e);
-    }
-  }
-}
-
-async function startWatcherIfConfigured() {
-  if (watcherStarted) return;
-  if (!SCANNER_CHANNEL) return;
-
-  watcherStarted = true;
-  try {
-    await initLastSeenLt();
-    console.log('Watcher ready. lastSeenLt=', lastSeenLt.toString());
-  } catch (e) {
-    console.error('Watcher init failed:', e?.message || e);
-  }
-
-  setInterval(async () => {
-    try {
-      await pollNewJettons();
-    } catch (e) {
-      console.error('Watcher poll error:', e?.message || e);
-    }
-  }, Math.max(10, POLL_INTERVAL_SEC) * 1000);
-}
-
-bot.catch((err) => {
-  console.error('Bot error:', err);
+  await ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true });
 });
+
+// ===== Track joins in Trending =====
+// Fires only if bot is admin in the channel and receives member updates
+bot.on('chat_member', async (ctx) => {
+  try {
+    const update = ctx.update.chat_member;
+    const chatId = update.chat.id;
+
+    // Only track for trending channel id
+    const trendingId = await getTrendingChatId();
+    if (chatId !== trendingId) return;
+
+    const newMember = update.new_chat_member;
+    const oldMember = update.old_chat_member;
+
+    // Detect a new join (left -> member)
+    const wasOut = ['left', 'kicked'].includes(oldMember.status);
+    const isIn = ['member', 'administrator', 'creator'].includes(newMember.status);
+    if (!wasOut || !isIn) return;
+
+    const joinedUser = newMember.user;
+    await upsertUser(joinedUser);
+
+    // Telegram provides invite_link used for join in chat_member update
+    const inviteLink = update.invite_link?.invite_link;
+    if (!inviteLink) return; // join not via our tracked link
+
+    // Find inviter by invite link
+    const inv = await pool.query(
+      `SELECT inviter_id FROM invites WHERE chat_id=$1 AND invite_link=$2`,
+      [chatId, inviteLink]
+    );
+    if (inv.rowCount === 0) return;
+
+    const inviterId = inv.rows[0].inviter_id;
+    if (String(inviterId) === String(joinedUser.id)) return; // no self-ref
+
+    // Store join (dedupe by (chat_id, joined_user_id))
+    await pool.query(
+      `INSERT INTO joins (chat_id, inviter_id, joined_user_id)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (chat_id, joined_user_id) DO NOTHING;`,
+      [chatId, inviterId, joinedUser.id]
+    );
+  } catch (e) {
+    console.error('chat_member handler error:', e);
+  }
+});
+
+// ===== Admin: backup & restore =====
+bot.command('backup', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const users = await pool.query(`SELECT * FROM users ORDER BY created_at ASC LIMIT 5000;`);
+  const invites = await pool.query(`SELECT * FROM invites LIMIT 5000;`);
+  const joins = await pool.query(`SELECT * FROM joins LIMIT 100000;`);
+  const blob = { users: users.rows, invites: invites.rows, joins: joins.rows, exported_at: new Date().toISOString() };
+
+  const jsonStr = JSON.stringify(blob, null, 2);
+  const buf = Buffer.from(jsonStr, 'utf-8');
+  await ctx.replyWithDocument({ source: buf, filename: `spyton-referral-backup-${Date.now()}.json` });
+});
+
+bot.command('restore', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await ctx.reply('Send the backup JSON file as a document, then I will restore it.', { disable_web_page_preview: true });
+});
+
+// Restore handler: admin sends a JSON doc
+bot.on('document', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const doc = ctx.message.document;
+  if (!doc?.file_name?.endsWith('.json')) return;
+
+  try {
+    const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+    const res = await fetch(fileLink.href);
+    const data = await res.json();
+
+    await pool.query('BEGIN');
+    // Insert users
+    for (const u of (data.users || [])) {
+      await pool.query(
+        `INSERT INTO users (user_id, username, first_name, created_at)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name;`,
+        [u.user_id, u.username, u.first_name, u.created_at || new Date().toISOString()]
+      );
+    }
+    // Invites
+    for (const i of (data.invites || [])) {
+      await pool.query(
+        `INSERT INTO invites (inviter_id, chat_id, invite_link, created_at)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (inviter_id, chat_id) DO UPDATE SET invite_link=EXCLUDED.invite_link;`,
+        [i.inviter_id, i.chat_id, i.invite_link, i.created_at || new Date().toISOString()]
+      );
+    }
+    // Joins
+    for (const j of (data.joins || [])) {
+      await pool.query(
+        `INSERT INTO joins (chat_id, inviter_id, joined_user_id, joined_at)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (chat_id, joined_user_id) DO NOTHING;`,
+        [j.chat_id, j.inviter_id, j.joined_user_id, j.joined_at || new Date().toISOString()]
+      );
+    }
+
+    await pool.query('COMMIT');
+    await ctx.reply('✅ Restore complete.');
+  } catch (e) {
+    try { await pool.query('ROLLBACK'); } catch (_) {}
+    console.error('restore error:', e);
+    await ctx.reply('❌ Restore failed. Ensure the file is a valid backup JSON from /backup.');
+  }
+});
+
+// ===== Daily leaderboard schedule (20:00 GMT+1 by default) =====
+// cron format: "m h * * *"
+const cronExpr = `${DAILY_MIN} ${DAILY_HOUR} * * *`;
+cron.schedule(cronExpr, async () => {
+  try {
+    await sendLeaderboard();
+  } catch (e) {
+    console.error('leaderboard schedule error:', e);
+  }
+}, { timezone: TZ });
 
 bot.launch().then(async () => {
-  console.log('SpyTON Scanner bot is running ✅');
-  await startWatcherIfConfigured();
+  await initDb();
+  console.log(`SpyTON Referral Bot running ✅`);
+  console.log(`Leaderboard schedule: ${cronExpr} TZ=${TZ}`);
 });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));

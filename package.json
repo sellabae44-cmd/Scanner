@@ -1,14 +1,17 @@
 {
-  "name": "spyton-scanner-bot",
+  "name": "spyton-referral-bot",
   "version": "1.0.0",
-  "description": "SpyTON Scanner Telegram bot (message template + 3-button keyboard with Dtrade deep link).",
+  "description": "SpyTON referral & community boost bot (Postgres persistence, daily leaderboard GMT+1).",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "db:migrate": "node scripts/migrate.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "pg": "^8.12.0",
     "telegraf": "^4.16.3"
   }
 }
