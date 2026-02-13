@@ -1,39 +1,52 @@
-# SpyTON Scanner Bot (Telegram)
+# SpyTON Scanner Bot (TON)
 
-This repo sends the **SpyTON Scanner — New Jetton Detected** card with **exactly 3 buttons**:
+A Telegram bot that:
+1) **Scans** a Jetton contract address (CA) and returns a SpyTON-style card + 3 buttons  
+2) **Auto-posts new Jetton deployments** to your scanner channel (like SunTools / SunPump new-tokens)
 
-1. **🟦 Buy with Dtrade** (fat / full-width row)
-2. **📣 Promote Your Token**
-3. **🔥 Trending**
+## 1) Quick start (Railway)
 
-It auto-attaches the CA into the Dtrade deep link using Telegram `start=` payload:
-`https://t.me/dtrade?start=<REF>_<CA>`
+1. Push this repo to GitHub (or upload ZIP to Railway)
+2. In Railway → Variables, set:
 
-## Setup
+- `BOT_TOKEN` (required)
+- `TONCENTER_API_KEY` (recommended)
+- `SCANNER_CHANNEL` (optional but needed for auto-post)  
+  Example: `@SpyTonScanner` or `-1001234567890`
 
-1) Install deps:
-```bash
-npm install
-```
+3. Deploy.
+4. Add the bot as **ADMIN** to your channel.
 
-2) Create `.env` from `.env.example`:
-```bash
-cp .env.example .env
-```
+## 2) How to use in Telegram
 
-3) Put your bot token:
-- `BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN`
+- `/start`
+- `/scan EQ...`
+- Or just send an address `EQ...` and it will respond.
 
-4) Run:
-```bash
-npm start
-```
+## 3) Auto-post new tokens (Jettons)
 
-## Usage
+When `SCANNER_CHANNEL` is set, the bot polls TON Center v3 endpoint:
 
-- Send a token CA (TON address like `EQ...`) to the bot
-- Or use: `/scan EQ...`
+- `/api/v3/jetton/masters` (latest Jetton masters)
 
-## Notes
-- Telegram `start` payload is limited to 64 characters and uses only: `A-Z a-z 0-9 _ -`
-- TON friendly addresses are base64url and usually safe.
+When a new Jetton master appears, it posts the SpyTON Scanner card to your channel.
+
+> Note: “Any new token on TON” is interpreted as “new Jetton master contract indexed by TON Center”.
+
+## 4) Customize the 3 buttons
+
+Edit Railway Variables:
+
+- `DTRADE_REF` → your Dtrade referral code (the bot auto-adds `_CA` into the start payload)
+- `PROMOTE_URL`
+- `TRENDING_URL`
+
+## 5) Notes / troubleshooting
+
+- If deployer link was wrong before: this version derives deployer from the **first transaction** on the jetton master (ascending LT).
+- If you see `Unknown` metadata, the jetton may not have on-chain metadata / not indexed yet.
+- If auto-post is not working:
+  - ensure the bot is admin in the channel
+  - ensure `SCANNER_CHANNEL` is correct (try `@channelusername`)
+  - set a `TONCENTER_API_KEY` to avoid rate limits
+
