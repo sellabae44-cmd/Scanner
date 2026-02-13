@@ -50,3 +50,12 @@ Edit Railway Variables:
   - ensure `SCANNER_CHANNEL` is correct (try `@channelusername`)
   - set a `TONCENTER_API_KEY` to avoid rate limits
 
+
+
+### Metadata & Social Links
+This bot tries to auto-fill Name/Symbol/Links from off-chain metadata (often stored in `uri` / `ipfs://...`).
+Set `IPFS_GATEWAY` if you prefer a different gateway.
+
+
+### Deployer address
+Deployer is shown shortened (e.g. `0:abcd…wxyz`) and is clickable.

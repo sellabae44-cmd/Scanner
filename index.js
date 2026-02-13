@@ -84,6 +84,15 @@ function formatLinksRow({ ca, deployer }) {
   return `<a href="${codeUrl}">Code</a> | <a href="${deployerUrl}">Deployer</a> | <a href="${holdersUrl}">Holders</a>`;
 }
 
+
+function shortAddr(addr) {
+  const a = String(addr || '').trim();
+  if (!a) return '—';
+  // Supports both "EQ..." and "0:..." forms
+  if (a.length <= 18) return a;
+  return `${a.slice(0, 10)}…${a.slice(-8)}`;
+}
+
 function escapeHtml(str) {
   return String(str)
     .replaceAll('&', '&amp;')
@@ -149,15 +158,18 @@ function pickMeta(content, keys) {
 
 function buildSocialLinks(jettonContent) {
   const content = jettonContent || {};
-  const tg =
+  let tg =
     pickMeta(content, ['telegram', 'tg', 'telegram_url', 'telegramUrl']) ||
     (content.social && pickMeta(content.social, ['telegram', 'tg']));
-  const web =
+  tg = normalizeSocialUrl('tg', tg);
+  let web =
     pickMeta(content, ['website', 'site', 'url', 'homepage']) ||
     (content.social && pickMeta(content.social, ['website', 'site', 'url']));
-  const x =
+  web = normalizeSocialUrl('web', web);
+  let x =
     pickMeta(content, ['twitter', 'x', 'twitter_url', 'x_url']) ||
     (content.social && pickMeta(content.social, ['twitter', 'x']));
+  x = normalizeSocialUrl('x', x);
 
   const parts = [];
   if (tg) parts.push(`<a href="${escapeHtml(String(tg))}">TG</a>`);
@@ -171,6 +183,117 @@ function buildSocialLinks(jettonContent) {
 
   return parts.join(' | ');
 }
+
+
+// --- Metadata enrichment (off-chain JSON / IPFS) ---
+// Many jettons store name/symbol/socials in off-chain JSON referenced by `uri`.
+// This makes "Links" auto-populate more often (like SunTools style).
+const IPFS_GATEWAY = process.env.IPFS_GATEWAY || 'https://ipfs.io/ipfs/';
+
+function toHttpFromIpfs(uri) {
+  if (!uri) return null;
+  const u = String(uri).trim();
+  if (u.startsWith('ipfs://')) {
+    return IPFS_GATEWAY.replace(/\/+$/,'/') + u.replace('ipfs://','');
+  }
+  return u;
+}
+
+function normalizeSocialUrl(kind, value) {
+  if (!value) return null;
+  let v = String(value).trim();
+  if (!v) return null;
+
+  // If only a handle is provided, convert to full URL
+  if (kind === 'tg') {
+    v = v.replace(/^@/, '');
+    if (!v.startsWith('http')) return `https://t.me/${v}`;
+  }
+  if (kind === 'x') {
+    v = v.replace(/^@/, '');
+    if (!v.startsWith('http')) return `https://x.com/${v}`;
+  }
+  if (kind === 'web') {
+    if (!v.startsWith('http')) v = 'https://' + v;
+  }
+  return v;
+}
+
+function extractLinksFromText(text) {
+  const t = String(text || '');
+  const out = {};
+
+  // Telegram
+  const tg = t.match(/https?:\/\/t\.me\/[A-Za-z0-9_]{3,}/i);
+  if (tg) out.tg = tg[0];
+
+  // Website
+  const web = t.match(/https?:\/\/[A-Za-z0-9.-]+\.[A-Za-z]{2,}[^ \n)"]*/i);
+  if (web) out.web = web[0];
+
+  // Twitter / X
+  const x = t.match(/https?:\/\/(x\.com|twitter\.com)\/[A-Za-z0-9_]{1,}/i);
+  if (x) out.x = x[0];
+
+  return out;
+}
+
+async function fetchJson(url) {
+  if (!url) return null;
+  try {
+    const res = await fetch(url, { redirect: 'follow' });
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    // Accept JSON or plain text JSON
+    if (!ct.includes('application/json') && !ct.includes('text/plain') && !ct.includes('text/json')) {
+      // Still try parse
+    }
+    return await res.json();
+  } catch (_) {
+    return null;
+  }
+}
+
+async function enrichJettonContent(jettonContent) {
+  const base = jettonContent || {};
+  // toncenter may return `uri` or `content_uri` or nested `metadata_uri`
+  const uri =
+    pickMeta(base, ['uri', 'content_uri', 'metadata_uri', 'metadataUri']) ||
+    (base.content && pickMeta(base.content, ['uri', 'content_uri', 'metadata_uri']));
+
+  const httpUri = toHttpFromIpfs(uri);
+  const meta = await fetchJson(httpUri);
+
+  // Merge: meta wins where base missing
+  const merged = { ...base };
+  if (meta && typeof meta === 'object') {
+    for (const [k, v] of Object.entries(meta)) {
+      if (merged[k] == null || merged[k] === '' || merged[k] === 'Unknown' || merged[k] === 'UNKNOWN') {
+        merged[k] = v;
+      }
+    }
+    // Some metadata nests socials
+    if (meta.social && typeof meta.social === 'object') {
+      merged.social = { ...(base.social || {}), ...meta.social };
+    }
+  }
+
+  // If socials still missing, try parse description text
+  const desc = pickMeta(merged, ['description', 'about']) || '';
+  const fromText = extractLinksFromText(desc);
+  if (fromText.tg && !pickMeta(merged, ['telegram', 'tg', 'telegram_url', 'telegramUrl']) && !(merged.social && pickMeta(merged.social, ['telegram','tg']))) {
+    merged.telegram = fromText.tg;
+  }
+  if (fromText.web && !pickMeta(merged, ['website', 'site', 'url', 'homepage']) && !(merged.social && pickMeta(merged.social, ['website','site','url']))) {
+    merged.website = fromText.web;
+  }
+  if (fromText.x && !pickMeta(merged, ['twitter', 'x', 'twitter_url', 'x_url']) && !(merged.social && pickMeta(merged.social, ['twitter','x']))) {
+    merged.twitter = fromText.x;
+  }
+
+  return merged;
+}
+
 
 async function toncenterGet(path, params = {}) {
   const qs = new URLSearchParams();
@@ -233,6 +356,8 @@ function renderScannerMessage(data) {
     socialLinks = 'TG ? | Web ? | X ?',
   } = data;
 
+  const deployerUrl = `${EXPLORER_BASE}${encodeURIComponent(deployer && deployer !== '—' ? deployer : ca)}`;
+
   const mintText =
     mintable === true ? '✅ Mintable' : mintable === false ? '❌ Not mintable' : '—';
   const adminText =
@@ -250,7 +375,7 @@ function renderScannerMessage(data) {
 
 <b>CA:</b>
 <code>${escapeHtml(ca)}</code>
-<b>Deployer:</b> <code>${escapeHtml(deployer)}</code>
+<b>Deployer:</b> <a href="${deployerUrl}"><code>${escapeHtml(shortAddr(deployer))}</code></a>
 <b>Admin/Mint:</b> ${mintText} / ${adminText}
 <b>Creator Balance:</b> ${escapeHtml(creatorBalText)}
 
@@ -279,7 +404,7 @@ async function buildJettonCard(ca) {
     };
   }
 
-  const content = master.jetton_content || {};
+  const content = await enrichJettonContent(master.jetton_content || {});
   const name = pickMeta(content, ['name', 'title']) || 'Unknown';
   const symbol = pickMeta(content, ['symbol', 'ticker']) || 'UNKNOWN';
   const decimals = Number(pickMeta(content, ['decimals'])) || 9;
